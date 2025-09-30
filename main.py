@@ -26,7 +26,13 @@ else:
     engine = create_engine(DB_URL, future=True)
 
 # FastAPI 앱 생성 (기존 그대로)
-app = FastAPI(title="Decathlon Review Analytics", version="0.2.0")
+app = FastAPI(
+    title="Decathlon Review Analytics",
+    version="0.2.0",
+    docs_url="/docs",
+    redoc_url=None,
+    openapi_url="/openapi.json"
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
