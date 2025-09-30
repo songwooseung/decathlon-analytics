@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pandas
+pydantic
+python-multipart
+psycopg2-binary
