@@ -10,12 +10,8 @@ from services.utils import now_iso
 
 CATEGORY_MAP = {
     "RUNNING":"RUNNING","running":"RUNNING","run":"RUNNING","러닝":"RUNNING",
-    "HIKING":"HIKING","hiking":"HIKING","trekking":"HIKING","등산":"HIKING","하이킹":"HIKING","등산/하이킹":"HIKING",
+    "HIKING":"HIKING","hiking":"HIKING","trekking":"HIKING","등산":"HIKING","하이킹":"HIKING","등산/하이킹":"HIKING", "스포츠":"HIKING"
 }
-
-def _norm_cat(cat: str|None) -> str|None:
-    if not cat: return None
-    return CATEGORY_MAP.get(str(cat).strip(), None)
 
 TOKEN_RE = re.compile(r"[^\w가-힣]+", re.UNICODE)
 
@@ -35,10 +31,10 @@ AD_NOISE_RE = re.compile("|".join([
 
 # 흔한 불용어 조금만 보강
 STOPWORDS |= {
-    "입니다","있습니다","합니다","같아요","같습니다","좋아요","좋습니다","좋네요","좋음","아주","정말",
+    "입니다","있습니다","합니다","같아요","같습니다","좋아요","좋네요","좋음","아주","정말",
     "진짜","조금","약간","살짝","그냥","다만","그리고","하지만","또한","또",
     "작성하기","고객이","별점","신제품","자세히","알아보기","모든","제품을","담기",
-    "남성","여성","스포츠","러닝웨어","가격이","가격도","가격에","가격대비","만원",
+    "러닝웨어","가격이","가격도","가격에","만원",
 }
 
 def _preclean_text(s: str) -> str:
