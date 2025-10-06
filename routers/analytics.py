@@ -10,7 +10,7 @@ from services.utils import now_iso
 
 CATEGORY_MAP = {
     "RUNNING":"RUNNING","running":"RUNNING","run":"RUNNING","러닝":"RUNNING",
-    "HIKING":"HIKING","hiking":"HIKING","trekking":"HIKING","등산":"HIKING","하이킹":"HIKING","등산/하이킹":"HIKING",
+    "HIKING":"HIKING","hiking":"HIKING","trekking":"HIKING","등산":"HIKING","하이킹":"HIKING","등산/하이킹":"HIKING, "스포츠":"HIKING"
 }
 
 def _norm_cat(cat: str|None) -> str|None:
