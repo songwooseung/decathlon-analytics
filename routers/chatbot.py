@@ -1,277 +1,359 @@
 # routers/chatbot.py
-
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Request, Response, Query
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+from uuid import uuid4
+from datetime import datetime, timedelta
+import os, time, json, re, requests
 
-from services.embeddings import search_similar, rebuild_index
-from services.utils import (
-    get_product_summary,     # product_summary에서 메타 조회
-    pick_positive_texts,     # 장점 2개 안전 추출
-    pick_negative_texts,     # 단점 2개 안전 추출
-)
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
+from core.db import get_db
+
+from services.rag_index import search_products, build_index_from_db, index_meta
+from openai import OpenAI
 
 router = APIRouter(prefix="/chatbot", tags=["chatbot"])
 
+# ----- 환경 -----
+ENV = os.getenv("ENV", "dev").lower()          # dev | prod
+COOKIE_NAME = "session_id"
+SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
+ANALYTICS_BASE = os.getenv("ANALYTICS_BASE", "http://127.0.0.1:8000")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# ----- 스키마 -----
 class ChatIn(BaseModel):
     message: str
 
+class Recommendation(BaseModel):
+    product_id: Optional[str] = None
+    name: Optional[str] = None
+    price: Optional[float] = None
+    link: Optional[str] = None
+    score: Optional[float] = None
+    rating: Optional[float] = None
+    evidence: Optional[List[Dict[str, Any]]] = None
+
 class ChatOut(BaseModel):
     answer: str
-    used_contexts: List[Dict[str, Any]]
+    recommendations: Optional[List[Recommendation]] = None
+    used_contexts: Optional[List[Dict[str, Any]]] = None
+    session_id: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
 
-# -------------------------------
-# 간단 상태(세션 없는 버전): 직전 추천 기억
-# -------------------------------
-LAST: Dict[str, Optional[str]] = {
-    "product_id": None,
-    "category": None,      # 예: "러닝", "등산/하이킹"
-    "subkw": None,         # 예: "자켓", "가방" ...
-}
+# ----- 쿠키/세션 -----
+def _set_session_cookie(response: Response, sid: str):
+    secure = (ENV == "prod")
+    samesite = "none" if secure else "lax"
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=sid,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        max_age=SESSION_TTL_HOURS * 3600,
+    )
 
-# -------------------------------
-# 동의어/토큰 정규화
-# -------------------------------
-REPLACE = {
-    # 서브 품목 계열
-    "재킷": "자켓",
-    "점퍼": "자켓",
-    "바람막이": "자켓",
-    "윈드재킷": "자켓",
-    "윈드 재킷": "자켓",
+def _ensure_session(request: Request, response: Response, db: Session) -> str:
+    sid = request.cookies.get(COOKIE_NAME)
+    now = datetime.utcnow()
+    exp = now + timedelta(hours=SESSION_TTL_HOURS)
 
-    "백팩": "가방",
-    "배낭": "가방",
-    "데이팩": "가방",
-    "daypack": "가방",
-    "pack": "가방",
+    # 공통 UPSERT SQL (행이 없어도 넣고, 있으면 갱신)
+    upsert_sql = text("""
+        INSERT INTO sessions (id, started_at, last_active, expires_at)
+        VALUES (:id, NOW(), NOW(), :exp)
+        ON CONFLICT (id) DO UPDATE
+            SET last_active = EXCLUDED.last_active,
+                expires_at  = EXCLUDED.expires_at;
+    """)
 
-    "캡": "모자",
-    "헤드밴드": "모자",
+    try:
+        if not sid:
+            sid = str(uuid4())
+            _set_session_cookie(response, sid)
+        db.execute(upsert_sql, {"id": sid, "exp": exp})
+        db.commit()
+        return sid
+    except ProgrammingError as e:
+        # 테이블이 없어서 실패한 경우 – 방어적으로 테이블 만들고 재시도
+        ensure_chatbot_tables()
+        db.execute(upsert_sql, {"id": sid, "exp": exp})
+        db.commit()
+        return sid
 
-    "티셔츠": "티",
-    "셔츠": "티",
+def _load_recent_context(db: Session, session_id: str, limit_turns: int = 6) -> List[Dict[str, Any]]:
+    rows = db.execute(text("""
+      SELECT role, content
+      FROM messages
+      WHERE session_id=:sid
+      ORDER BY created_at DESC
+      LIMIT :lim
+    """), {"sid": session_id, "lim": limit_turns}).fetchall()
+    return [{"role": r[0], "content": r[1]} for r in rows[::-1]]
 
-    "반바지": "쇼츠",
-}
+def _save_message(db, session_id, role, content, meta=None):
+    stmt = text("""
+        INSERT INTO messages (session_id, role, content, meta)
+        VALUES (:sid, :role, :content, CAST(:meta AS JSONB))
+    """)
+    db.execute(
+        stmt,
+        {
+            "sid": str(session_id),
+            "role": role,
+            "content": content,
+            "meta": json.dumps(meta or {}, ensure_ascii=False),
+        },
+    )
+    db.commit()
 
-CATEGORY_TOKENS = {
-    "러닝": ["러닝", "런닝", "조깅", "running"],
-    "등산/하이킹": ["등산", "하이킹", "트레킹", "hiking", "trekking"],
-}
+# ----- 라우팅/LLM & 스몰톡 -----
+def _route_kind(q: str) -> str:
+    if any(k in q.lower() for k in ["top", "count", "trend", "distribution", "average"]):
+        return "analytics"
+    if any(k in q for k in ["탑", "순위", "많이", "평균", "분포", "월별", "추이", "개수", "비율"]):
+        return "analytics"
+    return "rag"
 
-# 서브카테고리 동의어 풀(이 목록으로 이름/서브카테고리 매칭)
-SUBTOKENS = {
-    "자켓": ["자켓", "바람막이", "윈드재킷", "재킷", "wind"],
-    "가방": ["가방", "백팩", "배낭", "데이팩", "daypack", "pack"],
-    "모자": ["모자", "캡", "헤드밴드", "비니", "버킷햇", "hat", "cap"],
-    "양말": ["양말", "삭스", "socks"],
-    "티"  : ["티", "티셔츠", "top", "shirt"],
-    "쇼츠": ["쇼츠", "숏츠", "반바지", "shorts"],
-    "바지": ["바지", "팬츠", "하의", "pants"],
-    "벨트": ["벨트", "belt"],
-    "플라스크": ["플라스크", "물병", "보틀", "soft flask", "flask"],
-    "신발": ["신발", "러닝화", "하이킹화", "트레일러닝화", "슈즈", "shoes"],
-}
-
-HELLO = ["안녕", "안녕하세요", "하이", "hello", "hi"]
-THANKS = ["고마워", "감사", "덕분에"]
-
-def norm(s: str) -> str:
-    out = s
-    for a, b in REPLACE.items():
-        out = out.replace(a, b)
-    return out
-
-def detect_intent(msg: str) -> Dict[str, Optional[str]]:
-    """
-    msg에서 카테고리/서브키워드(품목) 추출
-      - category: None 가능(품목만 있는 요청 허용: 예) "가방 추천")
-      - subkw   : None 가능
-    """
-    m = norm(msg)
-    cat: Optional[str] = None
-    for k, toks in CATEGORY_TOKENS.items():
-        if any(t in m for t in toks):
-            cat = k
-            break
-
-    sub: Optional[str] = None
-    # 가장 구체적인 토큰부터 찾음
-    for sk, toks in SUBTOKENS.items():
-        if any(t in m for t in toks):
-            sub = sk
-            break
-
-    return {"category": cat, "subkw": sub}
-
-# -------------------------------
-# 포맷/메타/필터 도우미
-# -------------------------------
-def join_quotes(quotes: List[str]) -> str:
-    return " / ".join([f"“{q}”" for q in quotes]) if quotes else "정보 없음"
-
-def enrich_with_meta(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    meta = get_product_summary(str(doc.get("product_id")))
-    if not meta:
+_HELLOS = ["안녕", "안뇽", "하이", "hello", "hi"]
+_THANKS = ["고마워", "감사", "thanks", "thank you", "땡큐"]
+_INTENT_HINTS = [
+    "추천", "자켓", "재킷", "상의", "하의", "바지", "패딩", "점퍼", "베스트",
+    "티셔츠", "셔츠", "러닝화", "신발", "등산화", "가방", "가격", "예산", "링크"
+]
+def _is_smalltalk(q: str) -> Optional[str]:
+    low = (q or "").strip().lower()
+    if any(h in low for h in [w.lower() for w in _INTENT_HINTS]):
         return None
-    out = dict(doc)
-    out.update(meta)
-    return out
+    if any(w in low for w in [h.lower() for h in _HELLOS]):
+        return "hello"
+    if any(w in low for w in [t.lower() for t in _THANKS]):
+        return "thanks"
+    return None
 
-def contexts_to_brief(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [{"product_id": str(d.get("product_id")), "score": float(d.get("score", 0.0))} for d in docs]
+def _is_non_product(q: str) -> bool:
+    """날씨/일상/비상품 대화는 여기서 컷."""
+    low = (q or "").lower()
+    return any(k in low for k in ["날씨", "기온", "시간", "뉴스", "주가", "교통", "요리 레시피"])
 
-def _match_with_synonyms(text: str, subkw: str) -> bool:
-    """SUBTOKENS 내 모든 별칭 기준으로 부분 매칭 (대소문자 무시)"""
-    if not text or not subkw:
-        return False
-    text = text.lower()
-    for alias in SUBTOKENS.get(subkw, [subkw]):
-        if alias.lower() in text:
-            return True
-    return False
+def _call_llm(system_prompt: str, messages: List[Dict[str, str]]) -> str:
+    comp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "system", "content": system_prompt}] + messages,
+        temperature=0.3,
+        max_tokens=350,
+    )
+    return comp.choices[0].message.content.strip()
 
-def filter_by_intent(enriched_docs: List[Dict[str, Any]],
-                     category: Optional[str],
-                     subkw: Optional[str]) -> List[Dict[str, Any]]:
-    results = []
-    for e in enriched_docs:
-        # 카테고리 일치 우선
-        if category and e.get("category") != category:
-            continue
+SYSTEM_PROMPT = (
+    "당신은 데카트론 상품 리뷰 기반 어시스턴트입니다. "
+    "항상 리뷰/요약에서 찾은 근거로만 답하고, 확실하지 않으면 근거 부족을 알리세요. "
+    "추천은 제품명/대략 가격/핵심 장점 1-2개를 간단히 제시하세요. "
+    "출력은 간단한 문장 2-5개와 근거 스니펫 1-3개를 포함하세요."
+)
 
-        # 서브키워드 동의어 매칭
-        if subkw:
-            name = e.get("product_name", "")
-            subc = e.get("subcategory", "")
-            if not (_match_with_synonyms(name, subkw) or _match_with_synonyms(subc, subkw)):
-                continue
-
-        results.append(e)
-    return results
-
-def format_rec(e: Dict[str, Any], show_link=True, only_pos=False, only_neg=False) -> str:
-    pid = str(e["product_id"])
-    pos = pick_positive_texts(pid, limit=2) if not only_neg else []
-    neg = pick_negative_texts(pid, limit=2) if not only_pos and not only_neg else []
-    parts = [
-        f"{e['product_name']} ({pid})",
-        f"가격: {e['price']}원 · 평점 {e['avg_rating']}",
+# ----- 분석 API 매핑 -----
+def _analytics_dispatch(text_query: str) -> Dict[str, Any]:
+    mapping = [
+        (["러닝", "평점", "탑", "top"], "/running/top-rated"),
+        (["러닝", "리뷰", "많이", "top"], "/running/top-by-reviewcount"),
+        (["하이킹", "평점", "탑", "top"], "/hiking/top-rated"),
+        (["하이킹", "리뷰", "많이", "top"], "/hiking/top-by-reviewcount"),
+        (["월별", "추이"], "/total/monthly-reviews"),
+        (["가격", "분포", "전체"], "/total/price-bins"),
+        (["러닝", "가격", "분포"], "/running/price-distribution"),
+        (["하이킹", "가격", "분포"], "/hiking/price-distribution"),
+        (["워드클라우드", "러닝"], "/running/wordcloud"),
+        (["워드클라우드", "하이킹"], "/hiking/wordcloud"),
     ]
-    if only_neg:
-        parts.append(f"단점: {join_quotes(neg)}")
-    else:
-        parts.append(f"장점: {join_quotes(pos)}")
-        if neg and not only_pos:
-            parts.append(f"단점: {join_quotes(neg)}")
-    if show_link:
-        parts.append(f"제품 링크 : {e['url']}")
-    return "\n".join(parts)
+    q = text_query.lower()
+    for keys, path in mapping:
+        if all(k.lower() in q for k in keys):
+            url = f"{ANALYTICS_BASE}{path}"
+            try:
+                r = requests.get(url, timeout=5)
+                if r.ok:
+                    return {"endpoint": path, "data": r.json()}
+            except Exception as e:
+                return {"endpoint": path, "error": str(e)}
+    try:
+        r = requests.get(f"{ANALYTICS_BASE}/total/top-by-reviewcount", timeout=5)
+        if r.ok:
+            return {"endpoint": "/total/top-by-reviewcount", "data": r.json()}
+    except Exception as e:
+        return {"endpoint": "/total/top-by-reviewcount", "error": str(e)}
+    return {"endpoint": None, "error": "analytics not available"}
 
-# -------------------------------
-# 엔드포인트
-# -------------------------------
+# ----- 후속 질의/제어 신호 파서 -----
+def _control_from_text(q: str) -> Dict[str, Any]:
+    low = (q or "").lower()
+    ctrl: Dict[str, Any] = {}
+
+    # 더 저렴/비싼
+    if any(k in low for k in ["더 싸", "저렴", "싸진", "낮은 가격"]):
+        ctrl["price_bias"] = "cheaper"
+    if any(k in low for k in ["더 비싸", "고급", "프리미엄", "비싼"]):
+        ctrl["price_bias"] = "pricier"
+
+    # 비슷한
+    if any(k in low for k in ["비슷한", "유사한", "같은 라인", "같은 종류"]):
+        ctrl["prefer_similar"] = True
+
+    # 인기(리뷰수)
+    if any(k in low for k in ["인기", "리뷰 많", "베스트", "판매량"]):
+        ctrl["prefer"] = "popular"
+
+    # 가성비
+    if "가성비" in low:
+        ctrl["prefer"] = "value"
+
+    # O만원대 / 이하 / 이상
+    m = re.search(r"(\d+)\s*만\s*원\s*대", low)
+    if m:
+        n = int(m.group(1)) * 10000
+        ctrl["min_price"] = n
+        ctrl["max_price"] = n + 9999
+    m = re.search(r"(\d+)\s*만\s*원\s*(이하|밑|까지)", low)
+    if m:
+        ctrl["max_price"] = int(m.group(1)) * 10000
+    m = re.search(r"(\d+)\s*만\s*원\s*(이상|부터)", low)
+    if m:
+        ctrl["min_price"] = int(m.group(1)) * 10000
+
+    # “다른 제품” → 첫 결과는 건너뛰기
+    if any(k in low for k in ["다른 제품", "다른 거", "또 다른", "하나 더", "다른거"]):
+        ctrl["offset"] = 1
+
+    # “N개” 요청
+    m = re.search(r"(\d+)\s*개", low)
+    if m:
+        ctrl["top_k"] = max(1, min(5, int(m.group(1))))
+
+    return ctrl
+
+# ---------- Routes ----------
+@router.get("/health")
+def health():
+    try:
+        meta = index_meta()
+    except Exception as e:
+        meta = {"error": str(e)}
+    return {"ok": True, "index": meta, "env": ENV}
+
 @router.post("/reindex")
-def force_reindex():
-    idx = rebuild_index()
-    return {"ok": True, "docs": len(idx.get("docs", []))}
+def reindex(db: Session = Depends(get_db)):
+    info = build_index_from_db(db)
+    return {"ok": True, "index": info}
 
 @router.post("/chat", response_model=ChatOut)
-def chat(body: ChatIn):
-    user_msg_raw = (body.message or "").strip()
-    user_msg = norm(user_msg_raw)
+def chat(
+    req: ChatIn,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    debug: bool = Query(False),
+):
+    t0 = time.time()
+    session_id = _ensure_session(request, response, db)
+    history = _load_recent_context(db, session_id, limit_turns=6)
 
-    def is_short_plain(text: str) -> bool:
-        return (len(text) <= 15) and ("?" not in text) and ("추천" not in text) and ("요약" not in text) and ("단점" not in text)
+    # 비상품/스몰톡 가드
+    if _is_non_product(req.message):
+        answer = "죄송해요, 저는 제품 관련 질문에만 답할 수 있어요. 원하시는 품목(예: 방수 자켓)이나 예산을 알려주시면 바로 추천해드릴게요."
+        _save_message(db, session_id, "user", req.message, meta={"route": "non-product"})
+        _save_message(db, session_id, "assistant", answer, meta={"route": "non-product"})
+        latency_ms = int((time.time() - t0) * 1000)
+        return ChatOut(answer=answer, recommendations=None, used_contexts=None,
+                       session_id=session_id, meta={"latency_ms": latency_ms, "route": "non-product", "env": ENV})
 
-    if any(t in user_msg for t in HELLO) and is_short_plain(user_msg_raw):
-        return {"answer": "안녕하세요! 무엇을 도와드릴까요? (예: 제품 추천 / 리뷰 요약 / 단점 알려줘)", "used_contexts": []}
-    if any(t in user_msg for t in THANKS) and is_short_plain(user_msg_raw):
-        return {"answer": "도움이 되었다니 다행입니다. 필요하시면 언제든 말씀해 주세요.", "used_contexts": []}
+    st = _is_smalltalk(req.message)
+    if st == "hello":
+        answer = "안녕하세요! 무엇을 도와드릴까요? 자켓/바지/러닝화처럼 원하는 품목이나 예산을 말해주시면 바로 찾아드릴게요."
+        _save_message(db, session_id, "user", req.message, meta={"route": "smalltalk"})
+        _save_message(db, session_id, "assistant", answer, meta={"route": "smalltalk"})
+        latency_ms = int((time.time() - t0) * 1000)
+        return ChatOut(answer=answer, recommendations=None, used_contexts=None,
+                       session_id=session_id, meta={"latency_ms": latency_ms, "route": "smalltalk", "env": ENV})
+    if st == "thanks":
+        answer = "도움이 되어 기뻐요! 더 필요한 게 있으면 언제든 편하게 물어보세요 🙂"
+        _save_message(db, session_id, "user", req.message, meta={"route": "smalltalk"})
+        _save_message(db, session_id, "assistant", answer, meta={"route": "smalltalk"})
+        latency_ms = int((time.time() - t0) * 1000)
+        return ChatOut(answer=answer, recommendations=None, used_contexts=None,
+                       session_id=session_id, meta={"latency_ms": latency_ms, "route": "smalltalk", "env": ENV})
 
-    # 1) 의도 파악
-    intent = detect_intent(user_msg)
-    req_cat, req_sub = intent["category"], intent["subkw"]
+    # 분석 라우팅
+    route = _route_kind(req.message)
+    recs: List[Dict[str, Any]] = []
+    used_contexts: Optional[List[Dict[str, Any]]] = None
 
-    # 2) 검색 → 메타 합치기
-    raw_contexts = search_similar(user_msg, top_k=7)
-    enriched = [ed for d in raw_contexts if (ed := enrich_with_meta(d))]
+    if route == "analytics":
+        a = _analytics_dispatch(req.message)
+        if "data" in a:
+            data_preview = str(a["data"])[:300]
+            answer = f"분석형 질의로 판단되어 `{a['endpoint']}` 결과를 요약했습니다.\n요약 미리보기: {data_preview}"
+        else:
+            answer = f"분석 API 호출에 실패했습니다. endpoint={a.get('endpoint')}, error={a.get('error')}"
+    else:
+        # ---- 제품 추천 ----
+        ctrl = _control_from_text(req.message)
+        top_k = ctrl.get("top_k", 1)
 
-    if not enriched:
-        return {"answer": "죄송합니다. 관련 제품을 찾지 못했습니다.", "used_contexts": contexts_to_brief(raw_contexts)}
+        try:
+            recs = search_products(
+                req.message,
+                top_k=top_k,
+                offset=ctrl.get("offset", 0),
+                min_price=ctrl.get("min_price"),
+                max_price=ctrl.get("max_price"),
+                price_bias=ctrl.get("price_bias"),        # 'cheaper' | 'pricier' | None
+                prefer=ctrl.get("prefer"),                # 'popular' | 'value' | None
+                prefer_similar=ctrl.get("prefer_similar", False),
+            )
+        except Exception:
+            recs = []
 
-    if ("말고" in user_msg) or ("다른" in user_msg):
-        base_cat = LAST["category"] or req_cat
-        base_sub = LAST["subkw"] or req_sub
-        exclude_id = LAST["product_id"]
+        if debug:
+            used_contexts = recs
 
-        # 같은 category+subkw 우선
-        pool = filter_by_intent(enriched, base_cat, base_sub)
+        if recs:
+            top = recs[0]
+            prompt = (
+                f"사용자 질문: {req.message}\n\n"
+                f"추천 후보(1개):\n"
+                f"- 이름: {top.get('name')}\n- 가격: {top.get('price')}\n"
+                f"- 카테고리: {top.get('category')}/{top.get('subcategory')}\n"
+                f"- 링크: {top.get('link')}\n"
+                f"- 근거 스니펫: \"{top.get('snippet','')}\"\n"
+                f"- 평균 평점: {top.get('rating')}\n\n"
+                f"요구사항: 2~4문장으로 짧게 추천 사유를 설명하고, 제품명/가격/핵심 장점 1-2개/링크를 자연스럽게 포함하라."
+            )
+            llm_messages = [{"role": "user", "content": prompt}]
+            for h in history[-4:]:
+                llm_messages.insert(0, {"role": h["role"], "content": h["content"]})
+            answer = _call_llm(SYSTEM_PROMPT, llm_messages)
+        else:
+            answer = "요청과 맞는 제품을 찾기 어렵네요. 카테고리(예: 자켓/하의/신발)나 예산을 조금 더 알려줄래요?"
 
-        # 만약 품목이 있었는데 비면 그대로 리턴
-        if base_sub and not pool:
-            return {"answer": f"{base_sub} 쪽에서 다른 추천은 찾지 못했어요.", "used_contexts": []}
+        for r in recs:
+            r["evidence"] = [{
+                "snippet": r.get("snippet"),
+                "rating": r.get("rating"),
+                "source": r.get("source", "reviews")
+            }]
 
-        if not pool and base_cat:
-            pool = filter_by_intent(enriched, base_cat, None)
-        if not pool:
-            pool = enriched
+    _save_message(db, session_id, "user", req.message, meta={"route": route})
+    _save_message(db, session_id, "assistant", answer, meta={"route": route})
 
-        if exclude_id:
-            pool = [e for e in pool if str(e["product_id"]) != str(exclude_id)]
-        if not pool:
-            return {"answer": "다른 추천 결과를 찾지 못했습니다.", "used_contexts": contexts_to_brief(enriched[:3])}
-
-        best = pool[0]
-        LAST.update(product_id=str(best["product_id"]), category=best.get("category"), subkw=base_sub)
-        return {"answer": format_rec(best, show_link=True, only_pos=True), "used_contexts": contexts_to_brief(pool[:3])}
-
-    # 4) 카테고리/품목 기반 추천(예: “러닝 자켓”, “가방 추천”)
-    cand = filter_by_intent(enriched, req_cat, req_sub)
-
-    # 카테고리만 말했는데 실패하면, 카테고리만으로 한 번 더 좁혀보기
-    if not cand:
-        if req_sub:
-            return {"answer": f"요청하신 ‘{req_sub}’ 제품을 찾지 못했습니다. "
-                            f"예: 등산 {req_sub}, 러닝 {req_sub} 처럼 말해보세요.",
-                    "used_contexts": []}
-        cand = enriched
-
-    best = cand[0]
-
-    # 5-a) 요약 요청
-    if "요약" in user_msg:
-        LAST.update(product_id=str(best["product_id"]), category=best.get("category"), subkw=req_sub)
-        pos = pick_positive_texts(str(best["product_id"]), limit=2)
-        neg = pick_negative_texts(str(best["product_id"]), limit=2)
-        ans = (
-            f"제품 요약: {best['product_name']} ({best['product_id']})\n"
-            f"총 리뷰 {best['total_reviews']}개 / 평균 평점 {best['avg_rating']} / 가격 {best['price']}원\n"
-            f"장점: {join_quotes(pos)}\n"
-            f"단점: {join_quotes(neg)}\n"
-            f"제품 링크 : {best['url']}"
-        )
-        return {"answer": ans, "used_contexts": contexts_to_brief([best])}
-
-    # 5-b) 단점만 물어봄 → 직전 선택이 있으면 그걸, 없으면 이번 best
-    if "단점" in user_msg:
-        target = None
-        if LAST["product_id"]:
-            meta = get_product_summary(LAST["product_id"])
-            if meta:
-                target = meta
-        if not target:
-            target = best
-        LAST.update(product_id=str(target["product_id"]), category=target.get("category"), subkw=req_sub or LAST["subkw"])
-        return {
-            "answer": format_rec(target, show_link=False, only_neg=True),
-            "used_contexts": contexts_to_brief([target])
-        }
-
-    # 6) 기본 추천(요구: 기본은 장점만 노출, 링크 출력)
-    LAST.update(product_id=str(best["product_id"]), category=best.get("category"), subkw=req_sub)
-    return {
-        "answer": format_rec(best, show_link=True, only_pos=True),
-        "used_contexts": contexts_to_brief(cand[:3]),
-    }
+    latency_ms = int((time.time() - t0) * 1000)
+    return ChatOut(
+        answer=answer,
+        recommendations=recs or None,
+        used_contexts=used_contexts,
+        session_id=session_id,
+        meta={"latency_ms": latency_ms, "route": route, "env": ENV},
+    )
