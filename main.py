@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from core.config import APP_META
 from core.db import ensure_tables  # ★ 스타트업에서 테이블 자동 생성
@@ -31,13 +32,17 @@ def on_startup():
     # 코어 테이블(reviews/product_summary) + 챗봇 테이블(sessions/messages/summary) 모두 보장
     ensure_tables()
 
-@app.get("/", tags=["meta"])
-def root():
-    return {"ok": True, "service": "decathlon-analytics"}
-
-@app.get("/healthz", tags=["meta"])
+@app.get("/healthz", include_in_schema=False)
 def healthz():
-    return {"status": "ok"}   
+    return {"status": "ok"}
+
+@app.get("/", include_in_schema=False)
+def root():
+    return PlainTextResponse("ok")
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    return Response(status_code=200)
 
 # --------- 라우터 등록 ---------
 app.include_router(ingest.router)

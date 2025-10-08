@@ -3,7 +3,7 @@ from sqlalchemy import text
 from core.db import engine
 from services.utils import now_iso
 
-router = APIRouter(tags=["debug"])
+router = APIRouter(prefix="/debug", tags=["debug"])
 
 @router.get("/debug/reviews")
 def list_reviews(limit:int|None=None):
@@ -23,6 +23,6 @@ def list_summary(limit:int|None=None):
         rows = conn.execute(text(sql), params).mappings().all()
     return {"count": len(rows), "data": [dict(r) for r in rows]}
 
-@router.get("/")
-def root():
-    return {"ok": True, "service": "Decathlon Review Analytics", "time": now_iso()}
+@router.get("")   # 또는 @router.get("/")
+def list_root():  # 필요하면 /debug 에서 간단 상태 주도록
+    return {"ok": True, "now": now_iso()}
