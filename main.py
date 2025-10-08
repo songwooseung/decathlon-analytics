@@ -47,5 +47,5 @@ def root_head():
 # --------- 라우터 등록 ---------
 app.include_router(ingest.router)
 app.include_router(analytics.router)
-app.include_router(debug.router)
+app.include_router(debug.router, prefix="/debug")
 app.include_router(chatbot.router)
