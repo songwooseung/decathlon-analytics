@@ -160,7 +160,8 @@ def ingest_reviews_df(df: pd.DataFrame):
         "first_upload": is_first_upload
     }
 
-# ── Summary Ingest (메타 전용, 단 ‘첫 업로드’는 숫자도 반영)
+# ---- Summary Ingest (메타 전용, 단 ‘첫 업로드’는 숫자도 반영)
+# services/ingest.py 내부
 def ingest_summary_df(df: pd.DataFrame):
     ensure_tables()
 
@@ -182,11 +183,13 @@ def ingest_summary_df(df: pd.DataFrame):
     df["avg_rating"]       = df["avg_rating"].apply(to_float_any)
     df["url"]              = df["url"].apply(safe_str)
     df["thumbnail_url"]    = df["thumbnail_url"].apply(safe_str)
-    df["updated_at"]       = df["updated_at"].fillna(now_iso())
 
-    # 동일 product_id 여러 행일 수 있으니 최신만
+    # ✅ TIMESTAMP 컬럼 변환 (UTC 기준)
+    df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
+    df["updated_at"] = df["updated_at"].fillna(pd.Timestamp.utcnow())
+
+    # 동일 product_id 중 최신만 유지
     df = df.sort_values(by=["product_id","updated_at"]).drop_duplicates(subset=["product_id"], keep="last")
-
     if df.empty:
         return {"ok": True, "upserted": 0}
 
@@ -195,7 +198,7 @@ def ingest_summary_df(df: pd.DataFrame):
         first_summary_upload = (cur == 0)
 
         if first_summary_upload:
-            # 전체 필드 upsert (최초 1회는 숫자도 신뢰)
+            # 최초 업로드: 모든 필드 신뢰 (숫자 포함)
             rows = df.to_dict(orient="records")
             upsert_all = text("""
                 INSERT INTO product_summary (
@@ -223,30 +226,29 @@ def ingest_summary_df(df: pd.DataFrame):
                     updated_at    = EXCLUDED.updated_at;
             """)
             conn.execute(upsert_all, rows)
+
         else:
-            # 이후부터는 메타만 upsert (숫자는 항상 reviews에서 재계산)
-            rows = df[[
-                "product_id","product_name","category","subcategory","brand",
-                "price","url","thumbnail_url","updated_at"
-            ]].to_dict(orient="records")
-            upsert_meta = text("""
-                INSERT INTO product_summary (
-                    product_id, product_name, category, subcategory, brand,
-                    price, url, thumbnail_url, updated_at
-                ) VALUES (
-                    :product_id, :product_name, :category, :subcategory, :brand,
-                    :price, :url, :thumbnail_url, :updated_at
-                )
-                ON CONFLICT (product_id) DO UPDATE SET
-                    product_name = EXCLUDED.product_name,
-                    category     = EXCLUDED.category,
-                    subcategory  = EXCLUDED.subcategory,
-                    brand        = EXCLUDED.brand,
-                    price        = EXCLUDED.price,
-                    url          = EXCLUDED.url,
-                    thumbnail_url= EXCLUDED.thumbnail_url,
-                    updated_at   = EXCLUDED.updated_at;
-            """)
-            conn.execute(upsert_meta, rows)
+            # 이후 업로드: 기존/신규 분리
+            exist_ids = set(pd.read_sql(text("SELECT product_id FROM product_summary;"), conn)["product_id"].astype(str))
+            df_new = df[~df["product_id"].astype(str).isin(exist_ids)]
+
+            # 신규 상품만 “모든 필드” 채워서 INSERT
+            if not df_new.empty:
+                rows_new = df_new.to_dict(orient="records")
+                insert_full = text("""
+                    INSERT INTO product_summary (
+                        product_id, product_name, category, subcategory, brand,
+                        price, total_reviews, positive_reviews, mixed_reviews, negative_reviews, avg_rating,
+                        url, thumbnail_url, updated_at
+                    ) VALUES (
+                        :product_id, :product_name, :category, :subcategory, :brand,
+                        :price, :total_reviews, :positive_reviews, :mixed_reviews, :negative_reviews, :avg_rating,
+                        :url, :thumbnail_url, :updated_at
+                    )
+                    ON CONFLICT (product_id) DO NOTHING;
+                """)
+                conn.execute(insert_full, rows_new)
+
+        
 
     return {"ok": True, "upserted": int(len(df))}

@@ -42,8 +42,18 @@ def category_korean_label(std):
 # ── 숫자/금액/평점 정제 ──
 def to_int_any(x):
     s = safe_str(x)
-    if not s: return 0
-    s = re.sub(r"[^\d\-]", "", s)  # 콤마/원 등 제거
+    if not s:
+        return 0
+
+    # 1소수점 처리 (99.0 → 99)
+    if re.match(r"^\d+(\.\d+)?$", s):
+        try:
+            return int(float(s))
+        except Exception:
+            pass
+
+    # 콤마/원 단위 등 제거
+    s = re.sub(r"[^\d\-]", "", s)
     try:
         return int(s)
     except Exception:
