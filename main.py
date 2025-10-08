@@ -31,6 +31,14 @@ def on_startup():
     # 코어 테이블(reviews/product_summary) + 챗봇 테이블(sessions/messages/summary) 모두 보장
     ensure_tables()
 
+@app.get("/", tags=["meta"])
+def root():
+    return {"ok": True, "service": "decathlon-analytics"}
+
+@app.get("/healthz", tags=["meta"])
+def healthz():
+    return {"status": "ok"}   
+
 # --------- 라우터 등록 ---------
 app.include_router(ingest.router)
 app.include_router(analytics.router)
