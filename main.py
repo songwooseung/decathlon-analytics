@@ -12,16 +12,19 @@ app = FastAPI(**APP_META)
 ENV = os.getenv("ENV", "dev").lower()
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
-# credentials=True이면 * 사용 불가. 정확한 Origin 지정
-allow_origins = [FRONTEND_ORIGIN]
+# 쉼표로 여러 개 넣기 지원
+origins = [o.strip() for o in FRONTEND_ORIGIN.split(",") if o.strip()]
+
+# 필요하면 추가(중복 방지)
 if ENV == "dev":
-    # 로컬 개발 편의
-    allow_origins += ["http://localhost:3000", "http://127.0.0.1:3000"]
+    for o in ["http://localhost:3000", "http://127.0.0.1:3000"]:
+        if o not in origins:
+            origins.append(o)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=True,
+    allow_origins=origins,
+    allow_credentials=True,   # ★ 쿠키 허용
     allow_methods=["*"],
     allow_headers=["*"],
 )
