@@ -184,7 +184,7 @@ def ingest_summary_df(df: pd.DataFrame):
     df["url"]              = df["url"].apply(safe_str)
     df["thumbnail_url"]    = df["thumbnail_url"].apply(safe_str)
 
-    # ✅ TIMESTAMP 컬럼 변환 (UTC 기준)
+    # TIMESTAMP 컬럼 변환 (UTC 기준)
     df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
     df["updated_at"] = df["updated_at"].fillna(pd.Timestamp.utcnow())
 

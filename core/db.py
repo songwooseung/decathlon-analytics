@@ -103,4 +103,4 @@ def ensure_tables():
     with engine.begin() as conn:
         ensure_reviews_table(conn)
         ensure_summary_table(conn)
-        ensure_chatbot_tables(conn)   # ★ 세션/메시지까지 항상 보장
+        ensure_chatbot_tables(conn) 
